@@ -485,6 +485,16 @@
       .prototype-tag { white-space: normal; }
     }
 
+    .demo-controls { padding: 16px; margin-bottom: 16px; border: 1px solid var(--line); border-radius: 16px; background: var(--panel); }
+    .demo-controls p { color: var(--muted); font-size: 12px; line-height: 1.6; }
+    .scenario-buttons { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+    .scenario-buttons button { padding: 10px 14px; color: var(--text); background: #1c324c; border: 1px solid var(--line); border-radius: 10px; cursor: pointer; }
+    .scenario-buttons button[aria-pressed="true"] { border-color: var(--cyan); }
+    .safety-notice { padding: 14px; border: 1px solid #ffca80; border-radius: 12px; color: #ffe0ad; font-size: 13px; line-height: 1.6; }
+    .safety-notice[hidden] { display: none; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    button:focus-visible, input:focus-visible { outline: 2px solid var(--cyan); outline-offset: 3px; }
+    body.interrupted .seat, body.interrupted .ambient-orbit { transition: none; }
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; }
     }
@@ -501,11 +511,24 @@
         <div><strong>Charge &amp; Nap</strong><span>EV Rest Companion</span></div>
       </div>
       <div class="top-status">
-        <div class="top-pill hide-mobile"><span class="dot"></span>충전기 연결됨</div>
-        <div class="top-pill">P · 안전 정차</div>
+        <div class="top-pill" id="chargingStatus">⚡ 충전 중</div>
+        <div class="top-pill" id="parkingStatus">P · 안전 정차</div>
       </div>
     </header>
 
+    <section class="demo-controls" aria-label="차량 상태 시뮬레이터">
+      <strong>데모 차량 상태 · 실제 차량 제어 아님</strong>
+      <p>시작 전 또는 수면·기상 중 상태를 바꿔 안전 차단과 복귀를 확인하세요. 정상으로 돌아와도 수면은 자동 재개되지 않습니다.</p>
+      <div class="scenario-buttons">
+        <button data-scenario="normal" aria-pressed="true">정상 · P단/정차/충전</button>
+        <button data-scenario="driving" aria-pressed="false">주행 중</button>
+        <button data-scenario="unplugged" aria-pressed="false">충전 아님</button>
+        <button data-scenario="failure" aria-pressed="false">차량 제어 실패</button>
+      </div>
+      <label><input type="checkbox" id="failNextControl"> 다음 환경 전환 중 공조 제어 실패 체험 (1회)</label>
+      <p id="controlStatus" role="status">차량 제어 연결 정상 · 시뮬레이션</p>
+      <div class="safety-notice" id="safetyNotice" role="alert" hidden></div>
+    </section>
     <main class="app-frame">
       <div class="app-nav">
         <div class="vehicle-title"><strong>IONIQ 6</strong><span>급속 충전 · 운전석 케어</span></div>
@@ -549,7 +572,7 @@
               <div class="eta"><div class="label">충전 완료까지</div><strong id="chargeEta">32분</strong><span>목표 충전량 80%</span></div>
             </div>
             <div class="charge-track"><div class="charge-fill" id="chargeFill"></div></div>
-            <div class="charge-meta"><span>현재 주행가능거리 <strong id="range">276km</strong></span><span>충전전력 <strong>128kW</strong></span></div>
+            <div class="charge-meta"><span>현재 주행가능거리 <strong id="range">276km</strong></span><span>충전전력 <strong id="chargePower">128kW</strong></span></div>
           </div>
 
           <div class="mode-card">
@@ -612,6 +635,95 @@
     let chargeId = null;
     let toastId = null;
 
+    // Vehicle adapter boundary: replace only after SDK safety/acknowledgement checks.
+    const vehicle = { gear: 'P', speed: 0, charging: true, controlHealthy: true };
+    const vehicleAdapter = {
+      apply(action, index) {
+        if (!vehicle.controlHealthy || ($('failNextControl').checked && index === 1)) {
+          $('failNextControl').checked = false;
+          vehicle.controlHealthy = false;
+          throw new Error('차량 제어 응답 실패');
+        }
+        action();
+      },
+      restoreDefaults() {
+        // Demo only. A real adapter must await restore acknowledgements; never claim
+        // physical recovery from a failed API or move a seat automatically in motion.
+        $('seatValue').textContent = '105°';
+        $('climateValue').textContent = '24°C · 3단';
+        $('lightValue').textContent = '60%';
+        $('audioValue').textContent = '보통';
+      }
+    };
+    const pendingSteps = new Set();
+    function cancelSessionWork() {
+      clearInterval(timerId);
+      clearInterval(chargeId);
+      clearTimeout(toastId);
+      pendingSteps.forEach(clearTimeout);
+      pendingSteps.clear();
+      toast.classList.remove('show');
+      if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+    }
+    function scheduleStep(action, delay) {
+      const id = setTimeout(() => { pendingSteps.delete(id); action(); }, delay);
+      pendingSteps.add(id);
+    }
+    function startBlockReason() {
+      if (vehicle.gear !== 'P' || vehicle.speed !== 0) return '주행 중에는 수면 케어를 사용할 수 없습니다. 안전하게 정차한 뒤 P단으로 전환해 주세요.';
+      if (!vehicle.charging) return '충전 중이 아닙니다. 충전기를 연결하고 충전이 시작되면 다시 시도해 주세요.';
+      if (!vehicle.controlHealthy) return '차량 제어에 실패했습니다. 연결 상태를 확인한 뒤 정상 상태로 전환해 다시 시도해 주세요.';
+      return '';
+    }
+    function renderVehicleState() {
+      $('parkingStatus').textContent = vehicle.gear === 'P' && vehicle.speed === 0 ? 'P · 안전 정차' : `${vehicle.gear} · ${vehicle.speed}km/h · 수면 불가`;
+      $('chargingStatus').textContent = vehicle.charging ? '⚡ 충전 중' : '⚠ 충전 아님';
+      $('chargePower').textContent = vehicle.charging ? '128kW' : '0kW';
+      if (!vehicle.charging) $('chargeEta').textContent = '충전 대기';
+      $('controlStatus').textContent = vehicle.controlHealthy ? '차량 제어 연결 정상 · 시뮬레이션' : '⚠ 차량 제어 응답 실패 · 기본 화면 복귀 (시뮬레이션)';
+      const reason = startBlockReason();
+      startButton.disabled = !!reason;
+      voiceButton.disabled = !!reason || mode !== 'ready';
+      voiceConfirm.disabled = !!reason || mode !== 'ready';
+    }
+    function interruptNap(reason) {
+      resetDemo(true); // Preserves observed vehicle state; never fabricates P/charging.
+      document.body.classList.add('interrupted');
+      $('safetyNotice').hidden = false;
+      $('safetyNotice').textContent = `⚠ ${reason} 수면 케어를 중단하고 기본 화면·설정으로 복귀했습니다 (시뮬레이션).`;
+      $('eyebrow').textContent = 'Safety stop · Simulation';
+      $('heroTitle').textContent = '수면 케어를 사용할 수 없어요.';
+      $('heroLead').textContent = reason;
+      $('modeTitle').textContent = '수면 케어 차단';
+      $('modeDesc').textContent = '조건 확인 후 직접 다시 시작해 주세요';
+      $('modeIcon').textContent = '⚠';
+      $('voiceText').textContent = '기본 설정 복귀 · 시뮬레이션';
+      napSeconds = 0;
+      renderTimer();
+      $('napLabel').textContent = '진행 중인 수면 없음';
+      renderVehicleState();
+      speak(reason);
+    }
+    function runSteps(steps, delay, spacing) {
+      steps.forEach(([text, action], i) => scheduleStep(() => {
+        const reason = startBlockReason();
+        if (reason) { interruptNap(reason); return; }
+        try { vehicleAdapter.apply(action, i); showToast(text); }
+        catch { interruptNap(startBlockReason()); }
+      }, delay + i * spacing));
+    }
+    function setScenario(scenario) {
+      Object.assign(vehicle, { gear: 'P', speed: 0, charging: true, controlHealthy: true });
+      if (scenario === 'driving') Object.assign(vehicle, { gear: 'D', speed: 30, charging: false });
+      if (scenario === 'unplugged') vehicle.charging = false;
+      if (scenario === 'failure') vehicle.controlHealthy = false;
+      document.querySelectorAll('[data-scenario]').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.scenario === scenario)));
+      $('failNextControl').checked = false;
+      const reason = startBlockReason();
+      if (reason) interruptNap(reason);
+      else resetDemo();
+    }
+
     function speak(text) {
       if (!('speechSynthesis' in window)) return;
       window.speechSynthesis.cancel();
@@ -638,7 +750,7 @@
       $('miniFill').style.width = `${width}%`;
       $('range').textContent = `${Math.floor(276 + (charge - 58) * 4.7)}km`;
       const remain = Math.max(0, Math.ceil((80 - charge) * 1.45));
-      $('chargeEta').textContent = remain ? `${remain}분` : '완료';
+      $('chargeEta').textContent = vehicle.charging ? (remain ? `${remain}분` : '완료') : '충전 대기';
     }
 
     function renderTimer() {
@@ -655,7 +767,10 @@
     function closeVoiceModal() { voiceModal.classList.remove('open'); }
 
     function startNap() {
-      if (mode === 'sleeping') return;
+      const reason = startBlockReason();
+      if (reason) { interruptNap(reason); return; }
+      if (mode !== 'ready') return;
+      cancelSessionWork();
       closeVoiceModal();
       mode = 'sleeping';
       document.body.classList.remove('waking');
@@ -678,7 +793,8 @@
         ['수면 사운드 · 음량 5% 설정', () => { activateBadge(3); $('audioValue').textContent = '수면 · 5%'; }],
         ['일반 알림을 충전 완료까지 보류', () => { activateBadge(4); $('liveAudio').classList.add('on'); }]
       ];
-      steps.forEach(([text, action], i) => setTimeout(() => { action(); showToast(text); }, 250 + i * 620));
+      runSteps(steps, 250, 620);
+      renderVehicleState();
       speak('남은 충전시간을 확인했습니다. 27분 파워냅을 시작할게요. 충전 완료 5분 전에 깨워드리겠습니다.');
 
       clearInterval(timerId);
@@ -690,13 +806,15 @@
       }, 1000);
       chargeId = setInterval(() => {
         setCharge(charge + .38);
-        if (charge >= 80) completeNap();
+        if (charge >= 80) completeNap(true);
       }, 1000);
-      setTimeout(() => wakeButton.classList.add('visible'), 3500);
+      scheduleStep(() => wakeButton.classList.add('visible'), 3500);
     }
 
     function startWake() {
       if (mode !== 'sleeping') return;
+      pendingSteps.forEach(clearTimeout);
+      pendingSteps.clear();
       mode = 'waking';
       document.body.classList.remove('sleeping');
       document.body.classList.add('waking');
@@ -716,20 +834,24 @@
         ['운전석을 천천히 세웁니다', () => $('seatValue').textContent = '118°'],
         ['실내 공기를 환기합니다', () => $('climateValue').textContent = '22°C · 2단']
       ];
-      steps.forEach(([text, action], i) => setTimeout(() => { action(); showToast(text); }, 200 + i * 850));
+      runSteps(steps, 200, 850);
       speak('충전 완료까지 5분 남았습니다. 천천히 깨워드릴게요.');
     }
 
-    function completeNap() {
-      if (mode === 'complete') return;
+    function completeNap(chargingComplete = false) {
+      if (!['sleeping', 'waking'].includes(mode)) return;
+      cancelSessionWork();
       mode = 'complete';
       clearInterval(timerId);
       clearInterval(chargeId);
-      setCharge(80);
+      if (chargingComplete) setCharge(80);
       napSeconds = 0;
       renderTimer();
       document.body.classList.remove('sleeping');
-      document.body.classList.add('waking');
+      document.body.classList.remove('waking');
+      badges.forEach(id => $(id).classList.remove('active'));
+      lives.forEach(id => $(id).classList.remove('on'));
+      renderVehicleState();
       $('eyebrow').textContent = 'Charging complete';
       $('heroTitle').innerHTML = '충전도, 휴식도<br>완료됐어요.';
       $('heroLead').innerHTML = '차량 설정을 복귀했습니다.<br>안전하게 다음 여정을 시작하세요.';
@@ -738,25 +860,34 @@
       $('modeIcon').textContent = '✓';
       $('napLabel').textContent = '휴식 완료';
       $('voiceText').textContent = '충전이 완료되었습니다';
-      $('seatValue').textContent = '105°';
-      $('climateValue').textContent = '24°C · 3단';
-      $('lightValue').textContent = '60%';
-      $('audioValue').textContent = '보통';
+      vehicleAdapter.restoreDefaults();
       startButton.textContent = '처음부터 다시 체험';
       startButton.classList.remove('stop');
       wakeButton.classList.remove('visible');
-      showToast('충전 완료 · 차량 설정 복귀');
-      speak('충전이 완료되었습니다. 차량 설정을 원래대로 되돌렸어요. 편안한 휴식이 되셨나요?');
+      if (!chargingComplete) {
+        $('eyebrow').textContent = 'Rest ended';
+        $('heroTitle').textContent = '수면 케어를 종료했어요.';
+        $('heroLead').textContent = '기본 차량 설정으로 복귀했습니다 (시뮬레이션). 충전은 계속됩니다.';
+        $('modeTitle').textContent = '수면 케어 종료';
+        $('modeDesc').textContent = '직접 종료 · 충전량 유지';
+        $('voiceText').textContent = '차량 설정 복귀 · 시뮬레이션';
+      }
+      showToast(chargingComplete ? '충전 완료 · 차량 설정 복귀' : '수면 케어 종료 · 차량 설정 복귀');
+      speak(chargingComplete ? '충전이 완료되었습니다. 차량 설정을 원래대로 되돌렸어요.' : '수면 케어를 종료하고 차량 설정을 되돌렸어요.');
     }
 
-    function resetDemo() {
-      clearInterval(timerId);
-      clearInterval(chargeId);
+    function resetDemo(preserveCharge = false) {
+      const previousCharge = charge;
+      cancelSessionWork();
+      closeVoiceModal();
+      $('safetyNotice').hidden = true;
+      document.body.classList.remove('interrupted');
+      vehicleAdapter.restoreDefaults();
       mode = 'ready';
       charge = 58;
       napSeconds = 27 * 60;
       document.body.classList.remove('sleeping', 'waking');
-      setCharge(58);
+      setCharge(preserveCharge ? previousCharge : 58);
       renderTimer();
       badges.forEach(id => $(id).classList.remove('active'));
       lives.forEach(id => $(id).classList.remove('on'));
@@ -768,24 +899,25 @@
       $('modeIcon').textContent = '☾';
       $('voiceText').textContent = '“충전 끝날 때까지 재워줘”';
       $('napLabel').textContent = '예상 수면시간';
-      $('seatValue').textContent = '105°';
-      $('climateValue').textContent = '24°C · 3단';
-      $('lightValue').textContent = '60%';
-      $('audioValue').textContent = '보통';
       startButton.textContent = '수면 케어 시작';
       startButton.classList.remove('stop');
       wakeButton.classList.remove('visible');
+      renderVehicleState();
     }
 
+    document.querySelectorAll('[data-scenario]').forEach(button => {
+      button.addEventListener('click', () => setScenario(button.dataset.scenario));
+    });
     startButton.addEventListener('click', () => {
       if (mode === 'ready') startNap();
       else if (mode === 'complete') resetDemo();
       else completeNap();
     });
-    voiceButton.addEventListener('click', () => { voiceModal.classList.add('open'); speak('충전 끝날 때까지 재워줘'); });
+    voiceButton.addEventListener('click', () => { if (startBlockReason() || mode !== 'ready') return; voiceModal.classList.add('open'); speak('충전 끝날 때까지 재워줘'); });
     voiceConfirm.addEventListener('click', startNap);
     voiceModal.addEventListener('click', (e) => { if (e.target === voiceModal) closeVoiceModal(); });
     wakeButton.addEventListener('click', startWake);
+    renderVehicleState();
     document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeVoiceModal(); });
   </script>
 </body>
